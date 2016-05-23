@@ -1,0 +1,296 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PA Main 2011</title>
+  <style>
+  html, body, #map-div {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+  }
+  #loading {
+    background: url(images/loading.gif) no-repeat center;
+    pointer-events: none;
+    position: absolute;
+    height: 50px;
+    width: 50px;
+    z-index: 100;
+    top: 50%;
+    left: 50%;
+  }
+  </style>
+  <script src="http://maps.googleapis.com/maps/api/js?sensor=false&v=3.20"></script>
+  <script type="text/javascript" src="js/CanvasLayer.js"></script>
+  <script type="text/javascript" src="js/utils.js"></script>
+  <script type="text/javascript" src="js/stats.min.js"></script>
+  <script type="text/javascript" src="js/Glb.js"></script>
+  <script id="point-vertex-shader" type="x-shader/x-vertex">
+    attribute vec4 centroid; // vector of the centroids of the work and residence census block
+
+    attribute float aColor;
+
+
+    uniform float uSize;
+    uniform float uZoom;
+    uniform mat4 mapMatrix;
+
+    varying float vColor;
+
+    void main() {
+
+      vec4 position = mapMatrix * centroid;
+
+      gl_Position = position;
+      gl_PointSize = uSize;
+
+      vColor = aColor;
+    }
+  </script>
+  <script id="point-fragment-shader" type="x-shader/x-fragment">
+    precision lowp float;
+
+    varying float vColor;
+
+    vec4 setColor(vec4 color, float dist, float hardFraction) {
+      return color * clamp((0.5 - dist) / (0.5 - 0.5 * hardFraction), 0., 1.);
+    }
+
+    vec3 unpackColor(float f) {
+      vec3 color;
+      color.b = floor(f / 256.0 / 256.0);
+      color.g = floor((f - color.b * 256.0 * 256.0) / 256.0);
+      color.r = floor(f - color.b * 256.0 * 256.0 - color.g * 256.0);
+      return color / 256.0;
+    }
+
+    void main() {
+      gl_FragColor = vec4(unpackColor(vColor),.45);
+    }
+  </script>
+
+  <script>
+    /* begin stats */
+    var stats = new Stats();
+    stats.setMode(0); // 0: fps, 1: ms
+    // Align top-left
+    stats.domElement.style.position = 'absolute';
+    stats.domElement.style.left = '0px';
+    stats.domElement.style.top = '0px';
+    /* end stats */
+
+    var map;
+    var canvasLayer;
+    var gl;
+    var pointCount;
+    var data;
+    var arrayBuffer;
+    var ready;
+    var program;
+    var glb;
+    var pixelsToWebGLMatrix = new Float32Array(16);
+    var mapMatrix = new Float32Array(16);
+
+
+    /**
+    * Latitude-longitude-date data is a series of 2 32-bit floats and 1 32-bit integer little-endian encoded.
+    * Each lat-lng-date grouping represents a well.
+    */
+
+    var dataURL = "pa-od-jt00-2011.bin";
+
+    function load(url) {
+      //console.log("Loading...");
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url);
+      xhr.responseType = 'arraybuffer';
+      xhr.onload = function() {
+        var float32Array = new Float32Array(this.response);
+        setData(float32Array);
+        var el = document.getElementById("loading");
+        el.style['display'] = 'none';
+      }
+      xhr.send();
+    }
+
+    function setData(buffer) {
+      pointCount = buffer.length / 3;
+
+      data = buffer;
+      arrayBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, arrayBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+
+      var attributeLoc = gl.getAttribLocation(program, 'centroid');
+      gl.enableVertexAttribArray(attributeLoc);
+      gl.vertexAttribPointer(attributeLoc, 2, gl.FLOAT, false, 12, 0);
+
+      var attributeLoc = gl.getAttribLocation(program, 'aColor');
+      gl.enableVertexAttribArray(attributeLoc);
+      gl.vertexAttribPointer(attributeLoc, 1, gl.FLOAT, false, 12, 8);
+
+      ready = true;
+    }
+
+    var inEndDwell = false;
+    var countryPointSizePixels = 1;
+    var blockPointSizePixels = 10;
+    var pointSize;
+
+
+    function draw(transform) {
+      if (ready) {
+        gl.lineWidth(2);
+        gl.useProgram(program);
+
+        pointSize = countryPointSizePixels * Math.pow(blockPointSizePixels / countryPointSizePixels, (map.zoom - 7) / (21 - 7));
+
+        var sizeLoc = gl.getUniformLocation(program, 'uSize');
+        gl.uniform1f(sizeLoc, pointSize);
+
+        var zoomLoc = gl.getUniformLocation(program, 'uZoom');
+        gl.uniform1f(zoomLoc, map.zoom);
+
+        var matrixLoc = gl.getUniformLocation(program, 'mapMatrix');
+        gl.uniformMatrix4fv(matrixLoc, false, transform);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, arrayBuffer);
+
+        var attributeLoc = gl.getAttribLocation(program, 'centroid');
+        gl.enableVertexAttribArray(attributeLoc);
+        gl.vertexAttribPointer(attributeLoc, 2, gl.FLOAT, false, 12, 0);
+
+        var attributeLoc = gl.getAttribLocation(program, 'aColor');
+        gl.enableVertexAttribArray(attributeLoc);
+        gl.vertexAttribPointer(attributeLoc, 1, gl.FLOAT, false, 12, 8);
+
+        gl.drawArrays(gl.POINTS, 0, pointCount);
+      }
+    }
+
+    function update() {
+      stats.begin();
+      if (ready) {
+
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        var mapProjection = map.getProjection();
+
+        /**
+        * We need to create a transformation that takes world coordinate
+        * points in the pointArrayBuffer to the coodinates WebGL expects.
+        * 1. Start with second half in pixelsToWebGLMatrix, which takes pixel
+        *     coordinates to WebGL coordinates.
+        * 2. Scale and translate to take world coordinates to pixel coords
+        * see https://developers.google.com/maps/documentation/javascript/maptypes#MapCoordinate
+        */
+
+        // copy pixel->webgl matrix
+        mapMatrix.set(pixelsToWebGLMatrix);
+
+        // Scale to current zoom (worldCoords * 2^zoom)
+        var scale = canvasLayer.getMapScale();
+        scaleMatrix(mapMatrix, scale, scale);
+
+        var translation = canvasLayer.getMapTranslation();
+        translateMatrix(mapMatrix, translation.x, translation.y);
+        draw(mapMatrix);
+      }
+      stats.end();
+    }
+
+    function resize() {
+      var w = gl.canvas.width;
+      var h = gl.canvas.height;
+      gl.viewport(0, 0, w, h);
+
+      // matrix which maps pixel coordinates to WebGL coordinates
+      pixelsToWebGLMatrix.set([2/w, 0,   0, 0,
+        0,  -2/h, 0, 0,
+        0,   0,   0, 0,
+        -1,   1,   0, 1]);
+    }
+
+    function initMap() {
+      // initialize the map
+      var mapOptions = {
+        zoom: 12,
+        center: new google.maps.LatLng(40.4328, -80.00023),
+        mapTypeId: google.maps.MapTypeId.ROADMAP,
+        styles: [
+          {
+            "featureType": "road",
+            "elementType": "labels",
+            "stylers": [
+              { "visibility": "off" }
+            ]
+          },{
+            "featureType": "road",
+            "stylers": [
+              { "color": "#808080" },
+              { "weight": 0.2 }
+            ]
+          },{
+            "featureType": "poi",
+            "stylers": [
+              { "visibility": "on" }
+            ]
+          },{
+            "featureType": "landscape",
+            "stylers": [
+              { "visibility": "on" },
+              { "lightness": 91 }
+            ]
+          },{
+              "featureType": "water",
+              "stylers": [
+                  { "lightness": 78 }
+              ]
+          },{
+              "featureType": "poi",
+              "stylers": [
+                  { "lightness": 78 }
+              ]
+          }
+        ]
+      };
+      var mapDiv = document.getElementById('map-div');
+      map = new google.maps.Map(mapDiv, mapOptions);
+
+      // initialize the canvasLayer
+      var canvasLayerOptions = {
+        map: map,
+        resizeHandler: resize,
+        animate: true,
+        updateHandler: update
+      };
+      canvasLayer = new CanvasLayer(canvasLayerOptions);
+      gl = canvasLayer.canvas.getContext('experimental-webgl');
+      //gl.enable(gl.BLEND);
+      //gl.blendFunc( gl.SRC_ALPHA, gl.ONE );
+      gl.enable( gl.BLEND );
+      gl.blendEquationSeparate( gl.FUNC_ADD, gl.FUNC_ADD );
+      gl.blendFuncSeparate( gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA );
+
+      glb = new Glb(gl);
+      program = glb.programFromSources(document.getElementById('point-vertex-shader').text,
+      document.getElementById('point-fragment-shader').text);
+      load(dataURL);
+      window.addEventListener('resize', function () {  google.maps.event.trigger(map, 'resize') }, false);
+
+    }
+
+    function init() {
+      initMap();
+      document.body.appendChild(stats.domElement);
+    }
+
+    document.addEventListener('DOMContentLoaded', init, false);
+  </script>
+
+  </head>
+  <body>
+    <div id="map-div"></div>
+    <div id="loading"></div>
+  </body>
+</html>
