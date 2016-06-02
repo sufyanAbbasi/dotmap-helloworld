@@ -97,7 +97,7 @@
     * Each lat-lng-date grouping represents a well.
     */
 
-    var dataURL = "ak-od-jt00-2011.bin";
+    var dataURLs = ["ak-od-jt00-2011.bin", "pa-od-jt00-2011.bin"];
 
     function load(url) {
       //console.log("Loading...");
@@ -275,7 +275,10 @@
       glb = new Glb(gl);
       program = glb.programFromSources(document.getElementById('point-vertex-shader').text,
       document.getElementById('point-fragment-shader').text);
-      load(dataURL);
+      for(int i = 0; i < dataURLs.length; i++){
+        load(dataURLs[i]);
+      }
+      
       window.addEventListener('resize', function () {  google.maps.event.trigger(map, 'resize') }, false);
 
     }
